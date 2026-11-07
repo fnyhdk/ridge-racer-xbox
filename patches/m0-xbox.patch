@@ -1,0 +1,1218 @@
+--- a/tools/m0/gpu.c
++++ b/tools/m0/gpu.c
+@@ -116,12 +116,272 @@
+ /* --- interpolating a triangle -------------------------------------------- */
+ struct vtx { int x, y; int r, g, b; int u, v; };
+ 
++/* The same triangle, without a division per pixel.
++ *
++ * The reference loop below tests the three edge functions at every pixel of
++ * the bounding box and divides up to five times per pixel to interpolate.
++ * That is the clearest statement of what is drawn, and on a desktop it costs
++ * nothing worth mentioning; on the Xbox's Pentium III, where a division takes
++ * forty cycles, the divisions alone would eat a third of the frame.
++ *
++ * What changes here is only how the same numbers are reached:
++ *
++ *  - each edge function is linear in x along a row, so the pixels where all
++ *    three are non-negative form one span, found by solving three
++ *    inequalities instead of testing every pixel;
++ *
++ *  - each interpolated value is N(x) / area, with N linear in x. Its quotient
++ *    and remainder are carried from one pixel to the next by an addition and
++ *    a carry. Inside the triangle N is never negative, so the floor this
++ *    computes is the truncation C's division gives: the result is the same
++ *    to the last bit.
++ *
++ * Everything stays in 32 bits as long as twice the area is below 2^23 -- a
++ * triangle larger than video memory itself. The rare one beyond that goes
++ * through the reference loop, which is kept as it was. */
++struct step { int q, r, dq, dr; };
++
++/* Division by a number fixed for the whole triangle, without a divide.
++ *
++ * The divisions left at the start of each row are all by the same few
++ * numbers -- the area, the edges' slopes -- and on the Pentium III each costs
++ * forty cycles; a race frame has nineteen thousand rows. m is the reciprocal
++ * rounded down, floor((2^32 - 1) / d), at most one below 2^32 / d. For
++ * 0 <= n < 2^31 the estimate n * m / 2^32 then falls short of n / d by less
++ * than a half: it is the quotient or one less, and one comparison settles
++ * which. The result is C's division, exactly. */
++struct rdiv { u32 d, m; };
++
++static INLINE void rdiv_init(struct rdiv *r, u32 d)
++{
++    r->d = d;
++    r->m = 0xFFFFFFFFu / d;
++}
++
++static INLINE u32 rdiv_q(const struct rdiv *r, u32 n)
++{
++    u32 q = (u32)(((unsigned long long)n * r->m) >> 32);
++    if (n - q * r->d >= r->d) q++;
++    return q;
++}
++
++/* How a value moves as x grows by one: the same for every row. */
++static INLINE void step_slope(struct step *s, int dn, int area)
++{
++    s->dq = dn / area;
++    s->dr = dn % area;
++    if (s->dr < 0) { s->dr += area; s->dq--; }
++}
++
++/* Where it starts on a row: n0 is never negative inside the triangle. */
++static INLINE void step_start(struct step *s, int n0, const struct rdiv *area)
++{
++    s->q = (int)rdiv_q(area, (u32)n0);
++    s->r = n0 - s->q * (int)area->d;
++}
++
++static INLINE void step_next(struct step *s, int area)
++{
++    s->q += s->dq;
++    s->r += s->dr;
++    if (s->r >= area) { s->r -= area; s->q++; }
++}
++
++/* tex_lookup's state, read once per triangle rather than once per pixel.
++ * Under -fno-strict-aliasing every store into video memory may alias the
++ * globals, so the compiler cannot hoist them itself. */
++struct texctx { int bx, by, depth, cx, cy, um, uo, vm, vo; };
++
++static void texctx_init(struct texctx *t, u32 tp, u32 clut)
++{
++    t->bx = (int)(tp & 0xF) * 64;
++    t->by = (int)((tp >> 4) & 1) * 256;
++    t->depth = (int)((tp >> 7) & 3);
++    t->cx = (int)(clut & 0x3F) * 16;
++    t->cy = (int)((clut >> 6) & 0x1FF);
++    t->um = ~(tw_mx * 8); t->uo = (tw_ox & tw_mx) * 8;
++    t->vm = ~(tw_my * 8); t->vo = (tw_oy & tw_my) * 8;
++}
++
++/* The same texel as tex_lookup, zero when transparent. */
++static INLINE u16 texel(const struct texctx *t, int u, int v)
++{
++    u = ((u & t->um) | t->uo) & 255;
++    v = ((v & t->vm) | t->vo) & 255;
++    if (t->depth == 0) {
++        u16 w = vram_get(t->bx + (u >> 2), t->by + v);
++        return vram_get(t->cx + ((w >> ((u & 3) * 4)) & 0xF), t->cy);
++    }
++    if (t->depth == 1) {
++        u16 w = vram_get(t->bx + (u >> 1), t->by + v);
++        return vram_get(t->cx + ((w >> ((u & 1) * 8)) & 0xFF), t->cy);
++    }
++    return vram_get(t->bx + u, t->by + v);
++}
++
++/* Narrows [*lo, *hi] to the t >= 0 where w - t * d >= 0. rd divides by |d|. */
++static INLINE void edge_span(int w, int d, const struct rdiv *rd, int *lo, int *hi)
++{
++    if (d > 0) {
++        int t;
++        if (w < 0) { *hi = -1; return; }
++        t = (int)rdiv_q(rd, (u32)w);
++        if (t < *hi) *hi = t;
++    } else if (d < 0) {
++        if (w < 0) { int m = (int)rdiv_q(rd, (u32)(-w + -d - 1)); if (m > *lo) *lo = m; }
++    } else if (w < 0) {
++        *hi = -1;
++    }
++}
++
++#if defined(__GNUC__) || defined(__clang__)
++#define ALWAYS_INLINE __inline__ __attribute__((always_inline))
++#else
++#define ALWAYS_INLINE INLINE
++#endif
++
++/* The span of a textured, untinted triangle with no mask test: nine pixels in
++ * ten of a race. The general loop below asks at every pixel whether to tint,
++ * which texture depth, whether to test the mask; with the Pentium III's seven
++ * registers its state lives on the stack, and those questions cost more than
++ * the pixel. Here they are settled once per span -- depth is a constant at
++ * each call -- and what is drawn is the same, in the same order. Returns the
++ * number of transparent texels. */
++static ALWAYS_INLINE unsigned long span_tex(u16 *row, int lo, int hi,
++                                            struct step su, struct step sv, int ar,
++                                            const struct texctx *t, int depth,
++                                            int semi, int mode, int mset)
++{
++    unsigned long empty = 0;
++    u16 *p = row + lo, *end = row + hi + 1;
++    int uq = su.q, ur = su.r, vq = sv.q, vr = sv.r;
++    for (; p < end; p++) {
++        int u = ((uq & t->um) | t->uo) & 255, v = ((vq & t->vm) | t->vo) & 255;
++        u16 col;
++        if (depth == 0) {
++            u16 w = vram_get(t->bx + (u >> 2), t->by + v);
++            col = vram_get(t->cx + ((w >> ((u & 3) * 4)) & 0xF), t->cy);
++        } else if (depth == 1) {
++            u16 w = vram_get(t->bx + (u >> 1), t->by + v);
++            col = vram_get(t->cx + ((w >> ((u & 1) * 8)) & 0xFF), t->cy);
++        } else {
++            col = vram_get(t->bx + u, t->by + v);
++        }
++        if (col == 0) empty++;
++        else {
++            if (semi && (col & 0x8000)) col = blend(*p, col, mode);
++            *p = (u16)(col | mset);
++        }
++        uq += su.dq; ur += su.dr; if (ur >= ar) { ur -= ar; uq++; }
++        vq += sv.dq; vr += sv.dr; if (vr >= ar) { vr -= ar; vq++; }
++    }
++    return empty;
++}
++
++/* The same span in fixed point, when that is provably the same.
++ *
++ * span_tex steps u as a quotient and a remainder, exactly: u = n / area, two
++ * adds and a compare per coordinate, and its state spills off the Pentium
++ * III's seven registers. Here u is one 32-bit number: the low eight bits of
++ * the quotient on top, 24 bits of fraction below. Adding the step wraps the
++ * top byte by itself, which is the & 255 the texture page applies, and
++ * u >> 24 is the texel column. The same for v.
++ *
++ * Why the same texel. Write the true u in units of 2^-24: T(k) = n(k) * 2^24
++ * / area at pixel k. The start fraction and the step's fraction are rounded
++ * down, so after k steps the sum has lost less than k + 1 units; it starts
++ * with `len` units added, so for every k < len it is at or above T(k). The
++ * true fraction is a whole number of 1/area, so the next whole u lies at
++ * least 2^24 / area units above T(k); with len * area < 2^24 the sum, at most
++ * T(k) + len, stays below it. Its top byte is therefore floor(T) & 255, the
++ * value span_tex reads. Spans longer than that, which only very large
++ * triangles have, go through span_tex.
++ *
++ * The other conditions are the triangle's: no texture window (the masks are
++ * then all ones and zero), and a page and CLUT that do not run off the edge
++ * of video memory, so that the wrap vram_get applies never happens and a
++ * pointer can stand in for it. */
++static INLINE u32 frac24(u32 r, const struct rdiv *a)
++{
++    /* floor(r * 2^24 / d) for r < d < 2^23, by long division in base 256. */
++    u32 x = r << 8, q1, q2, q3;
++    q1 = rdiv_q(a, x); x = (x - q1 * a->d) << 8;
++    q2 = rdiv_q(a, x); x = (x - q2 * a->d) << 8;
++    q3 = rdiv_q(a, x);
++    return (q1 << 16) | (q2 << 8) | q3;
++}
++
++static ALWAYS_INLINE unsigned long span_fix(u16 *p, u16 *end, u32 U, u32 V,
++                                            u32 dU, u32 dV, const u16 *tex,
++                                            const u16 *clut, int depth,
++                                            int semi, int mode, u16 mset)
++{
++    unsigned long empty = 0;
++    for (; p < end; p++) {
++        u32 u = U >> 24, v = V >> 24;
++        u16 col;
++        if (depth == 0)
++            col = clut[(tex[(v << 10) + (u >> 2)] >> ((u & 3) << 2)) & 0xF];
++        else if (depth == 1)
++            col = clut[(tex[(v << 10) + (u >> 1)] >> ((u & 1) << 3)) & 0xFF];
++        else
++            col = tex[(v << 10) + u];
++        U += dU; V += dV;
++        if (col == 0) { empty++; continue; }
++        if (semi && (col & 0x8000)) col = blend(*p, col, mode);
++        *p = (u16)(col | mset);
++    }
++    return empty;
++}
++
++/* span_fix with depth and semi-transparency made constants. */
++static unsigned long span_fix_any(u16 *p, u16 *end, u32 U, u32 V, u32 dU, u32 dV,
++                                  const u16 *tex, const u16 *clut, int depth,
++                                  int semi, int mode, u16 mset)
++{
++    switch (depth * 2 + (semi != 0)) {
++    case 0:  return span_fix(p, end, U, V, dU, dV, tex, clut, 0, 0, mode, mset);
++    case 1:  return span_fix(p, end, U, V, dU, dV, tex, clut, 0, 1, mode, mset);
++    case 2:  return span_fix(p, end, U, V, dU, dV, tex, clut, 1, 0, mode, mset);
++    case 3:  return span_fix(p, end, U, V, dU, dV, tex, clut, 1, 1, mode, mset);
++    case 4: case 6:
++             return span_fix(p, end, U, V, dU, dV, tex, clut, 2, 0, mode, mset);
++    default: return span_fix(p, end, U, V, dU, dV, tex, clut, 2, 1, mode, mset);
++    }
++}
++
++/* floor(n / d) in the top byte, and the rest in 24 bits of fraction rounded
++ * down -- span_fix's form -- for an n of either sign. */
++static u32 fix_value(long long n, const struct rdiv *d)
++{
++    long long q, r;
++    /* A 64-bit division is a library call on the Pentium III; n nearly
++       always fits in 32 bits, and d < 2^23 always does. */
++    if (n == (long long)(int)n) { q = (int)n / (int)d->d; r = (int)n % (int)d->d; }
++    else { q = n / (long long)d->d; r = n % (long long)d->d; }
++    if (r < 0) { r += d->d; q--; }
++    return ((u32)q << 24) + frac24((u32)r, d);
++}
++
++static void tri_reference(struct vtx a, struct vtx b, struct vtx c,
++                          int textured, int shaded, int semi, int mode,
++                          u32 tp, u32 clut, int blended, long long area,
++                          int minx, int maxx, int miny, int maxy);
++
+ static void tri(struct vtx a, struct vtx b, struct vtx c,
+                 int textured, int shaded, int semi, int mode,
+                 u32 tp, u32 clut, int blended)
+ {
+-    int minx, maxx, miny, maxy, x, y;
+-    long area = (long)(b.x - a.x) * (c.y - a.y) - (long)(c.x - a.x) * (b.y - a.y);
++    int minx, maxx, miny, maxy, x, y, ar, d0, d1, d2;
++    int interp_uv, interp_rgb, modulate, mtest, mset;
++    unsigned long n_empty = 0, n_full = 0, n_drawn = 0;
++    struct step su, sv, sr, sg, sb;
++    struct rdiv rarea, rd0, rd1, rd2;
++    struct texctx tc;
++    int fix, fix_tri = 0;
++    u32 fix_len = 0, fix_du = 0, fix_dv = 0, fix_u0 = 0, fix_v0 = 0, fix_uy = 0, fix_vy = 0, span;
++    const u16 *fix_tex = 0, *fix_clut = 0;
++    long long area = (long long)(b.x - a.x) * (c.y - a.y) - (long long)(c.x - a.x) * (b.y - a.y);
+     if (area == 0) return;
+     if (area < 0) { struct vtx t = b; b = c; c = t; area = -area; }
+ 
+@@ -136,12 +396,177 @@
+     /* An outsized triangle always comes from a coordinate read wrong: drawing
+        it would cost minutes without showing anything true. */
+     if (maxx - minx > 1024 || maxy - miny > 512) return;
++
++    if (area >= (1 << 23)) {
++        tri_reference(a, b, c, textured, shaded, semi, mode, tp, clut, blended,
++                      area, minx, maxx, miny, maxy);
++        return;
++    }
++    ar = (int)area;
++    /* How each edge function falls as x grows by one. */
++    d0 = b.y - a.y; d1 = c.y - b.y; d2 = a.y - c.y;
++    /* A texture tinted by 128 on every vertex comes out unchanged: (t * 128)
++       >> 7 is t, and the colour never moves, the weights summing to the area.
++       Nine pixels in ten of a race are drawn so; they skip the tint. */
++    modulate = textured && blended
++            && !(a.r == 128 && a.g == 128 && a.b == 128 && b.r == 128 && b.g == 128
++                 && b.b == 128 && c.r == 128 && c.g == 128 && c.b == 128);
++    interp_uv = textured;
++    interp_rgb = !textured || modulate;
++    if (textured) texctx_init(&tc, tp, clut);
++    mtest = mask_test;
++    mset = mask_set ? 0x8000 : 0;
++    /* w1 weights a, w2 weights b, w0 weights c: N(x+1) - N(x) is constant. */
++#define DN(k) (-(d1 * a.k + d2 * b.k + d0 * c.k))
++    (void)shaded;
++    rdiv_init(&rarea, (u32)ar);
++    if (d0) rdiv_init(&rd0, (u32)(d0 > 0 ? d0 : -d0));
++    if (d1) rdiv_init(&rd1, (u32)(d1 > 0 ? d1 : -d1));
++    if (d2) rdiv_init(&rd2, (u32)(d2 > 0 ? d2 : -d2));
++    if (interp_uv) { step_slope(&su, DN(u), ar); step_slope(&sv, DN(v), ar); }
++    if (interp_rgb) {
++        step_slope(&sr, DN(r), ar);
++        step_slope(&sg, DN(g), ar);
++        step_slope(&sb, DN(b), ar);
++    }
++    /* span_fix's conditions; fix_len is the longest span it can take. */
++    fix = textured && !modulate && !mtest && tw_mx == 0 && tw_my == 0
++       && (tc.depth == 0 || (tc.depth == 1 ? tc.bx <= 1024 - 128 && tc.cx <= 1024 - 256
++                                            : tc.bx <= 1024 - 256));
++    if (fix) {
++        fix_len = (u32)((1u << 24) - 1) / (u32)ar;
++        fix_du = ((u32)su.dq << 24) + frac24((u32)su.dr, &rarea);
++        fix_dv = ((u32)sv.dq << 24) + frac24((u32)sv.dr, &rarea);
++        fix_tex = VRAM + (tc.by << 10) + tc.bx;
++        fix_clut = VRAM + (tc.cy << 10) + tc.cx;
++        /* The whole triangle from one start, stepped across and down rather
++           than divided again on every row. The argument is span_fix's, over
++           i + j steps instead of k: at most w + h of them, so the margin is
++           w + h + 1 and it has to fit under 2^24 / area as len did. */
++        span = (u32)(maxx - minx) + (u32)(maxy - miny) + 1;
++        if (span <= fix_len) {
++            long long e0 = (long long)(b.x - a.x) * (miny - a.y) - (long long)(minx - a.x) * d0;
++            long long e1 = (long long)(c.x - b.x) * (miny - b.y) - (long long)(minx - b.x) * d1;
++            long long e2 = (long long)(a.x - c.x) * (miny - c.y) - (long long)(minx - c.x) * d2;
++            fix_tri = 1;
++            fix_u0 = fix_value(e1 * a.u + e2 * b.u + e0 * c.u, &rarea) + span;
++            fix_v0 = fix_value(e1 * a.v + e2 * b.v + e0 * c.v, &rarea) + span;
++            /* How the weights grow as y grows by one. */
++            fix_uy = fix_value((long long)(c.x - b.x) * a.u + (long long)(a.x - c.x) * b.u
++                               + (long long)(b.x - a.x) * c.u, &rarea);
++            fix_vy = fix_value((long long)(c.x - b.x) * a.v + (long long)(a.x - c.x) * b.v
++                               + (long long)(b.x - a.x) * c.v, &rarea);
++        }
++    }
++
++    for (y = miny; y <= maxy; y++) {
++        int lo = 0, hi = maxx - minx, w0, w1, w2;
++        w0 = (int)((long long)(b.x - a.x) * (y - a.y) - (long long)(minx - a.x) * d0);
++        w1 = (int)((long long)(c.x - b.x) * (y - b.y) - (long long)(minx - b.x) * d1);
++        w2 = (int)((long long)(a.x - c.x) * (y - c.y) - (long long)(minx - c.x) * d2);
++        edge_span(w0, d0, &rd0, &lo, &hi);
++        edge_span(w1, d1, &rd1, &lo, &hi);
++        edge_span(w2, d2, &rd2, &lo, &hi);
++        if (lo > hi) continue;
++        if (fix_tri) {
++            u16 *row = VRAM + ((y & 511) << 10) + minx;
++            u32 len = (u32)(hi - lo + 1), j = (u32)(y - miny);
++            unsigned long e = span_fix_any(row + lo, row + hi + 1,
++                                           fix_u0 + j * fix_uy + (u32)lo * fix_du,
++                                           fix_v0 + j * fix_vy + (u32)lo * fix_dv,
++                                           fix_du, fix_dv, fix_tex, fix_clut,
++                                           tc.depth, semi, mode, (u16)mset);
++            n_empty += e;
++            n_full += len - e;
++            n_drawn += len - e;
++            continue;
++        }
++        w0 -= lo * d0; w1 -= lo * d1; w2 -= lo * d2;
++#define N0(k) (w1 * a.k + w2 * b.k + w0 * c.k)
++        if (interp_uv) {
++            step_start(&su, N0(u), &rarea);
++            step_start(&sv, N0(v), &rarea);
++        }
++        if (interp_rgb) {
++            step_start(&sr, N0(r), &rarea);
++            step_start(&sg, N0(g), &rarea);
++            step_start(&sb, N0(b), &rarea);
++        }
++#undef N0
++        if (fix && (u32)(hi - lo) < fix_len) {
++            u16 *row = VRAM + ((y & 511) << 10) + minx;
++            u32 len = (u32)(hi - lo + 1);
++            u32 U = ((u32)su.q << 24) + frac24((u32)su.r, &rarea) + len;
++            u32 V = ((u32)sv.q << 24) + frac24((u32)sv.r, &rarea) + len;
++            unsigned long e = span_fix_any(row + lo, row + hi + 1, U, V, fix_du, fix_dv,
++                                           fix_tex, fix_clut, tc.depth, semi, mode, (u16)mset);
++            n_empty += e;
++            n_full += len - e;
++            n_drawn += len - e;
++        } else if (textured && !modulate && !mtest) {
++            u16 *row = VRAM + ((y & 511) << 10) + minx;
++            unsigned long e;
++            switch (tc.depth) {
++            case 0:  e = span_tex(row, lo, hi, su, sv, ar, &tc, 0, semi, mode, mset); break;
++            case 1:  e = span_tex(row, lo, hi, su, sv, ar, &tc, 1, semi, mode, mset); break;
++            default: e = span_tex(row, lo, hi, su, sv, ar, &tc, 2, semi, mode, mset); break;
++            }
++            n_empty += e;
++            n_full += (unsigned long)(hi - lo + 1) - e;
++            n_drawn += (unsigned long)(hi - lo + 1) - e;
++        } else {
++            /* put_pixel, unfolded: the span lies inside the drawing area,
++               which lies inside video memory, so its bounds tests always
++               pass here. The order of what remains is the same. */
++            u16 *row = VRAM + ((y & 511) << 10);
++            for (x = minx + lo; x <= minx + hi; x++) {
++                u16 col, old;
++                int s;
++                if (textured) {
++                    col = texel(&tc, su.q, sv.q);
++                    if (col == 0) { n_empty++; goto next; }
++                    n_full++;
++                    if (modulate) {
++                        int r = ((col & 31) * sr.q) >> 7, g = (((col >> 5) & 31) * sg.q) >> 7,
++                            bl = (((col >> 10) & 31) * sb.q) >> 7;
++                        if (r > 31) r = 31; if (g > 31) g = 31; if (bl > 31) bl = 31;
++                        col = (u16)(r | (g << 5) | (bl << 10) | (col & 0x8000));
++                    }
++                    s = semi && (col & 0x8000);
++                } else {
++                    col = (u16)((sr.q >> 3) | ((sg.q >> 3) << 5) | ((sb.q >> 3) << 10));
++                    s = semi;
++                }
++                old = row[x];
++                if (!(mtest && (old & 0x8000))) {
++                    if (s) col = blend(old, col, mode);
++                    row[x] = (u16)(col | mset);
++                    n_drawn++;
++                }
++            next:
++                if (interp_uv) { step_next(&su, ar); step_next(&sv, ar); }
++                if (interp_rgb) { step_next(&sr, ar); step_next(&sg, ar); step_next(&sb, ar); }
++            }
++        }
++    }
++    tex_empty += n_empty;
++    tex_full += n_full;
++    g_pixels += n_drawn;
++#undef DN
++}
+ 
++/* The reference: every pixel of the box tested, every value divided. */
++static void tri_reference(struct vtx a, struct vtx b, struct vtx c,
++                          int textured, int shaded, int semi, int mode,
++                          u32 tp, u32 clut, int blended, long long area,
++                          int minx, int maxx, int miny, int maxy)
++{
++    int x, y;
+     for (y = miny; y <= maxy; y++) {
+         for (x = minx; x <= maxx; x++) {
+-            long w0 = (long)(b.x - a.x) * (y - a.y) - (long)(x - a.x) * (b.y - a.y);
+-            long w1 = (long)(c.x - b.x) * (y - b.y) - (long)(x - b.x) * (c.y - b.y);
+-            long w2 = (long)(a.x - c.x) * (y - c.y) - (long)(x - c.x) * (a.y - c.y);
++            long long w0 = (long long)(b.x - a.x) * (y - a.y) - (long long)(x - a.x) * (b.y - a.y);
++            long long w1 = (long long)(c.x - b.x) * (y - b.y) - (long long)(x - b.x) * (c.y - b.y);
++            long long w2 = (long long)(a.x - c.x) * (y - c.y) - (long long)(x - c.x) * (a.y - c.y);
+             u16 col;
+             if (w0 < 0 || w1 < 0 || w2 < 0) continue;
+             /* w1 weights a, w2 weights b, w0 weights c */
+@@ -228,16 +653,43 @@
+     else { w = h = 16; }
+     if (w > 1024) w = 1024;
+     if (h > 512) h = 512;
+-    for (j = 0; j < h; j++)
+-        for (i = 0; i < w; i++) {
+-            if (tex) {
+-                u16 t;
+-                if (!tex_lookup(bu + i, bv + j, texpage, clut, &t)) continue;
+-                put_pixel(x + i, y + j, t, semi && (t & 0x8000), mode);
+-            } else {
+-                put_pixel(x + i, y + j, to15(col), semi, mode);
++    {
++        /* The rectangle is clipped to the drawing area once, rather than
++           each pixel being offered to put_pixel to refuse; what remains is
++           put_pixel unfolded, as in tri. (tex_empty and tex_full no longer
++           count the texels of clipped pixels, which were never drawn.) */
++        int i0 = 0, i1 = w - 1, j0 = 0, j1 = h - 1;
++        int x0 = draw_x0 > 0 ? draw_x0 : 0, x1 = draw_x1 < 1023 ? draw_x1 : 1023;
++        int y0 = draw_y0 > 0 ? draw_y0 : 0, y1 = draw_y1 < 511 ? draw_y1 : 511;
++        int mtest = mask_test, mset = mask_set ? 0x8000 : 0;
++        unsigned long n_drawn = 0;
++        u16 flat = to15(col);
++        struct texctx tc;
++        if (x + i0 < x0) i0 = x0 - x;
++        if (x + i1 > x1) i1 = x1 - x;
++        if (y + j0 < y0) j0 = y0 - y;
++        if (y + j1 > y1) j1 = y1 - y;
++        if (tex) texctx_init(&tc, texpage, clut);
++        for (j = j0; j <= j1; j++) {
++            u16 *row = VRAM + ((y + j) << 10);
++            for (i = i0; i <= i1; i++) {
++                u16 c = flat, old;
++                int s = semi;
++                if (tex) {
++                    c = texel(&tc, bu + i, bv + j);
++                    if (c == 0) { tex_empty++; continue; }
++                    tex_full++;
++                    s = semi && (c & 0x8000);
++                }
++                old = row[x + i];
++                if (mtest && (old & 0x8000)) continue;
++                if (s) c = blend(old, c, mode);
++                row[x + i] = (u16)(c | mset);
++                n_drawn++;
+             }
+         }
++        g_pixels += n_drawn;
++    }
+ }
+ 
+ static void draw_poly(u32 op)
+@@ -286,18 +738,40 @@
+     }
+ }
+ 
++/* What drawing costs, for a platform that wants to show it: it sets
++   gpu_clock to a cycle counter, and the time spent in fills, polygons, lines
++   and rectangles adds up in gpu_draw_ticks. Left null, nothing is measured. */
++unsigned long long (*gpu_clock)(void);
++unsigned long long gpu_draw_ticks;
++
++static void execute_op(void);
++
+ static void execute(void)
+ {
+     u32 op = fifo[0] >> 24;
++    if (gpu_clock && op >= 0x02 && op <= 0x7F) {
++        unsigned long long t0 = gpu_clock();
++        execute_op();
++        gpu_draw_ticks += gpu_clock() - t0;
++    } else {
++        execute_op();
++    }
++}
++
++static void execute_op(void)
++{
++    u32 op = fifo[0] >> 24;
+     prim_hist[op]++;
+     prim_count++;
+     if (op == 0x02) {                          /* plain fill */
+         int x = (int)(fifo[1] & 0x3F0), y = (int)((fifo[1] >> 16) & 0x1FF);
+         int w = (int)(((fifo[2] & 0x3FF) + 15) & ~15), h = (int)((fifo[2] >> 16) & 0x1FF);
+         int i, j;
+-        for (j = 0; j < h; j++)
+-            for (i = 0; i < w; i++)
+-                vram_put(x + i, y + j, to15(fifo[0]));
++        u16 c = to15(fifo[0]);
++        for (j = 0; j < h; j++) {
++            u16 *row = VRAM + (((y + j) & 511) << 10);
++            for (i = 0; i < w; i++) row[(x + i) & 1023] = c;
++        }
+     } else if (op >= 0x20 && op <= 0x3F) {
+         draw_poly(op);
+     } else if (op >= 0x40 && op <= 0x5F) {
+--- a/tools/m0/gte.c
++++ b/tools/m0/gte.c
+@@ -1,4 +1,5 @@
+ /* The PlayStation GTE. See gte.h for the scope and the method of checking. */
++#define GTE_IMPL
+ #include "gte.h"
+ 
+ GTE gte;
+@@ -37,21 +38,21 @@
+ 
+ /* MAC1-3 are 44-bit accumulators: beyond that, the overflow is signalled but
+  * the value kept is truncated to 32 bits. */
+-static s32 mac123(int n, s64 v)
++static ALWAYS_INLINE s32 mac123(int n, s64 v)
+ {
+     if (v >= (s64)1 << 43) gte.FLAG |= F_MAC1_POS >> (n - 1);
+     if (v < -((s64)1 << 43)) gte.FLAG |= F_MAC1_NEG >> (n - 1);
+     return (s32)v;
+ }
+ 
+-static s32 mac0(s64 v)
++static ALWAYS_INLINE s32 mac0(s64 v)
+ {
+     if (v > (s64)0x7FFFFFFF) gte.FLAG |= F_MAC0_POS;
+     if (v < -(s64)0x80000000) gte.FLAG |= F_MAC0_NEG;
+     return (s32)v;
+ }
+ 
+-static s16 sat_ir(int n, s32 v, int lm)
++static ALWAYS_INLINE s16 sat_ir(int n, s32 v, int lm)
+ {
+     s32 lo = lm ? 0 : -0x8000;
+     if (v > 0x7FFF) { gte.FLAG |= F_IR1 >> (n - 1); return 0x7FFF; }
+@@ -59,28 +60,28 @@
+     return (s16)v;
+ }
+ 
+-static s16 sat_ir0(s32 v)
++static ALWAYS_INLINE s16 sat_ir0(s32 v)
+ {
+     if (v > 0x1000) { gte.FLAG |= F_IR0; return 0x1000; }
+     if (v < 0)      { gte.FLAG |= F_IR0; return 0; }
+     return (s16)v;
+ }
+ 
+-static u8 sat_col(int n, s32 v)
++static ALWAYS_INLINE u8 sat_col(int n, s32 v)
+ {
+     if (v > 0xFF) { gte.FLAG |= F_R >> (n - 1); return 0xFF; }
+     if (v < 0)    { gte.FLAG |= F_R >> (n - 1); return 0; }
+     return (u8)v;
+ }
+ 
+-static u16 sat_sz3(s32 v)
++static ALWAYS_INLINE u16 sat_sz3(s32 v)
+ {
+     if (v > 0xFFFF) { gte.FLAG |= F_SZ3; return 0xFFFF; }
+     if (v < 0)      { gte.FLAG |= F_SZ3; return 0; }
+     return (u16)v;
+ }
+ 
+-static s16 sat_sxy(int y, s32 v)
++static ALWAYS_INLINE s16 sat_sxy(int y, s32 v)
+ {
+     if (v > 0x3FF)  { gte.FLAG |= y ? F_SY2 : F_SX2; return 0x3FF; }
+     if (v < -0x400) { gte.FLAG |= y ? F_SY2 : F_SX2; return -0x400; }
+@@ -106,12 +107,17 @@
+     unr_ready = 1;
+ }
+ 
+-static u32 gte_divide(u16 h, u16 sz3)
++static ALWAYS_INLINE u32 gte_divide(u16 h, u16 sz3)
+ {
+     u32 n, d, u, z;
+     if (!unr_ready) unr_init();
+     if (h >= sz3 * 2) { gte.FLAG |= F_DIV; return 0x1FFFF; }
++    /* sz3 > 0 here, since h >= 0. */
++#if defined(__GNUC__) || defined(__clang__)
++    z = (u32)__builtin_clz((u32)sz3) - 16;
++#else
+     for (z = 0; z < 16 && !((sz3 << z) & 0x8000); z++) { }
++#endif
+     n = (u32)h << z;
+     d = (u32)sz3 << z;
+     u = unr_table[(d - 0x7FC0) >> 7] + 0x101;
+@@ -121,196 +127,39 @@
+     return n > 0x1FFFF ? 0x1FFFF : n;
+ }
+ 
+-/* ------------------------------------------------------------------- access */
+-void gte_write_data(int reg, u32 v)
+-{
+-    s16 lo = (s16)(v & 0xFFFF), hi = (s16)(v >> 16);
+-    switch (reg) {
+-    case 0:  gte.VX0 = lo; gte.VY0 = hi; break;
+-    case 1:  gte.VZ0 = lo; break;
+-    case 2:  gte.VX1 = lo; gte.VY1 = hi; break;
+-    case 3:  gte.VZ1 = lo; break;
+-    case 4:  gte.VX2 = lo; gte.VY2 = hi; break;
+-    case 5:  gte.VZ2 = lo; break;
+-    case 6:  gte.RGBC = v; break;
+-    case 7:  gte.OTZ = (u16)v; break;
+-    case 8:  gte.IR0 = lo; break;
+-    case 9:  gte.IR1 = lo; break;
+-    case 10: gte.IR2 = lo; break;
+-    case 11: gte.IR3 = lo; break;
+-    case 12: gte.SX0 = lo; gte.SY0 = hi; break;
+-    case 13: gte.SX1 = lo; gte.SY1 = hi; break;
+-    case 14: gte.SX2 = lo; gte.SY2 = hi; break;
+-    /* SXYP: writing pushes the stack of screen coordinates. */
+-    case 15: gte.SX0 = gte.SX1; gte.SY0 = gte.SY1;
+-             gte.SX1 = gte.SX2; gte.SY1 = gte.SY2;
+-             gte.SX2 = lo;      gte.SY2 = hi; break;
+-    case 16: gte.SZ0 = (u16)v; break;
+-    case 17: gte.SZ1 = (u16)v; break;
+-    case 18: gte.SZ2 = (u16)v; break;
+-    case 19: gte.SZ3 = (u16)v; break;
+-    case 20: gte.RGB0 = v; break;
+-    case 21: gte.RGB1 = v; break;
+-    case 22: gte.RGB2 = v; break;
+-    case 23: gte.RES1 = (s32)v; break;
+-    case 24: gte.MAC0 = (s32)v; break;
+-    case 25: gte.MAC1 = (s32)v; break;
+-    case 26: gte.MAC2 = (s32)v; break;
+-    case 27: gte.MAC3 = (s32)v; break;
+-    /* IRGB: writing unpacks a 5-5-5 colour into IR1-3, at scale x16. */
+-    case 28: gte.IRGB = v & 0x7FFF;
+-             gte.IR1 = (s16)((v & 0x1F) << 7);
+-             gte.IR2 = (s16)(((v >> 5) & 0x1F) << 7);
+-             gte.IR3 = (s16)(((v >> 10) & 0x1F) << 7);
+-             break;
+-    case 29: break;   /* ORGB is read only */
+-    case 30: {
+-        u32 x = (u32)v, m = (v & 0x80000000u) ? ~x : x;
+-        int c = 0;
+-        gte.LZCS = (s32)v;
+-        while (c < 32 && !(m & 0x80000000u)) { c++; m <<= 1; }
+-        gte.LZCR = (v == 0 || v == 0xFFFFFFFFu) ? 32 : c;
+-        break;
+-    }
+-    case 31: break;   /* LZCR is read only */
+-    default: break;
+-    }
+-}
++/* ------------------------------------------------------------------- access
++ *
++ * The register moves are in gte.h, so that the translated code -- which
++ * always names the register as a constant -- compiles each one to a single
++ * load or store. These are the same moves, for callers that are not. */
++void gte_write_data(int reg, u32 v) { gte_wd(reg, v); }
++u32 gte_read_data(int reg) { return gte_rd(reg); }
++void gte_write_ctrl(int reg, u32 v) { gte_wc(reg, v); }
++u32 gte_read_ctrl(int reg) { return gte_rc(reg); }
+ 
+-u32 gte_read_data(int reg)
+-{
+-    switch (reg) {
+-    case 0:  return (u16)gte.VX0 | ((u32)(u16)gte.VY0 << 16);
+-    case 1:  return (u32)(s32)gte.VZ0;
+-    case 2:  return (u16)gte.VX1 | ((u32)(u16)gte.VY1 << 16);
+-    case 3:  return (u32)(s32)gte.VZ1;
+-    case 4:  return (u16)gte.VX2 | ((u32)(u16)gte.VY2 << 16);
+-    case 5:  return (u32)(s32)gte.VZ2;
+-    case 6:  return gte.RGBC;
+-    case 7:  return gte.OTZ;
+-    case 8:  return (u32)(s32)gte.IR0;
+-    case 9:  return (u32)(s32)gte.IR1;
+-    case 10: return (u32)(s32)gte.IR2;
+-    case 11: return (u32)(s32)gte.IR3;
+-    case 12: return (u16)gte.SX0 | ((u32)(u16)gte.SY0 << 16);
+-    case 13: return (u16)gte.SX1 | ((u32)(u16)gte.SY1 << 16);
+-    case 14:
+-    case 15: return (u16)gte.SX2 | ((u32)(u16)gte.SY2 << 16);
+-    case 16: return gte.SZ0;
+-    case 17: return gte.SZ1;
+-    case 18: return gte.SZ2;
+-    case 19: return gte.SZ3;
+-    case 20: return gte.RGB0;
+-    case 21: return gte.RGB1;
+-    case 22: return gte.RGB2;
+-    case 23: return (u32)gte.RES1;
+-    case 24: return (u32)gte.MAC0;
+-    case 25: return (u32)gte.MAC1;
+-    case 26: return (u32)gte.MAC2;
+-    case 27: return (u32)gte.MAC3;
+-    case 28:
+-    case 29: {
+-        /* ORGB: IR1-3 brought down to 5 bits, saturated, read back as one
+-           colour. */
+-        s32 r = gte.IR1 / 128, g = gte.IR2 / 128, b = gte.IR3 / 128;
+-        r = r < 0 ? 0 : (r > 31 ? 31 : r);
+-        g = g < 0 ? 0 : (g > 31 ? 31 : g);
+-        b = b < 0 ? 0 : (b > 31 ? 31 : b);
+-        return (u32)(r | (g << 5) | (b << 10));
+-    }
+-    case 30: return (u32)gte.LZCS;
+-    case 31: return (u32)gte.LZCR;
+-    default: return 0;
+-    }
+-}
+ 
+-void gte_write_ctrl(int reg, u32 v)
+-{
+-    s16 lo = (s16)(v & 0xFFFF), hi = (s16)(v >> 16);
+-    if (reg < 5) { gte.RT[reg * 2] = lo; if (reg * 2 + 1 < 9) gte.RT[reg * 2 + 1] = hi; return; }
+-    if (reg >= 8 && reg < 13) { int i = (reg - 8) * 2; gte.LLM[i] = lo; if (i + 1 < 9) gte.LLM[i + 1] = hi; return; }
+-    if (reg >= 16 && reg < 21) { int i = (reg - 16) * 2; gte.LCM[i] = lo; if (i + 1 < 9) gte.LCM[i + 1] = hi; return; }
+-    switch (reg) {
+-    case 5:  gte.TRX = (s32)v; break;
+-    case 6:  gte.TRY = (s32)v; break;
+-    case 7:  gte.TRZ = (s32)v; break;
+-    case 13: gte.RBK = (s32)v; break;
+-    case 14: gte.GBK = (s32)v; break;
+-    case 15: gte.BBK = (s32)v; break;
+-    case 21: gte.RFC = (s32)v; break;
+-    case 22: gte.GFC = (s32)v; break;
+-    case 23: gte.BFC = (s32)v; break;
+-    case 24: gte.OFX = (s32)v; break;
+-    case 25: gte.OFY = (s32)v; break;
+-    case 26: gte.H = (u16)v; break;
+-    case 27: gte.DQA = lo; break;
+-    case 28: gte.DQB = (s32)v; break;
+-    case 29: gte.ZSF3 = lo; break;
+-    case 30: gte.ZSF4 = lo; break;
+-    case 31: gte.FLAG = v & 0x7FFFF000u; flag_end(); break;
+-    default: break;
+-    }
+-}
+ 
+-u32 gte_read_ctrl(int reg)
+-{
+-    if (reg < 5) {
+-        u32 a = (u16)gte.RT[reg * 2];
+-        u32 b = (reg * 2 + 1 < 9) ? (u32)(u16)gte.RT[reg * 2 + 1] : 0;
+-        return (reg == 4) ? (u32)(s32)gte.RT[8] : (a | (b << 16));
+-    }
+-    if (reg >= 8 && reg < 13) {
+-        int i = (reg - 8) * 2;
+-        if (reg == 12) return (u32)(s32)gte.LLM[8];
+-        return (u32)(u16)gte.LLM[i] | ((u32)(u16)gte.LLM[i + 1] << 16);
+-    }
+-    if (reg >= 16 && reg < 21) {
+-        int i = (reg - 16) * 2;
+-        if (reg == 20) return (u32)(s32)gte.LCM[8];
+-        return (u32)(u16)gte.LCM[i] | ((u32)(u16)gte.LCM[i + 1] << 16);
+-    }
+-    switch (reg) {
+-    case 5:  return (u32)gte.TRX;
+-    case 6:  return (u32)gte.TRY;
+-    case 7:  return (u32)gte.TRZ;
+-    case 13: return (u32)gte.RBK;
+-    case 14: return (u32)gte.GBK;
+-    case 15: return (u32)gte.BBK;
+-    case 21: return (u32)gte.RFC;
+-    case 22: return (u32)gte.GFC;
+-    case 23: return (u32)gte.BFC;
+-    case 24: return (u32)gte.OFX;
+-    case 25: return (u32)gte.OFY;
+-    case 26: return (u32)(s32)(s16)gte.H;   /* read back signed: a hardware quirk */
+-    case 27: return (u32)(s32)gte.DQA;
+-    case 28: return (u32)gte.DQB;
+-    case 29: return (u32)(s32)gte.ZSF3;
+-    case 30: return (u32)(s32)gte.ZSF4;
+-    case 31: return gte.FLAG;
+-    default: return 0;
+-    }
+-}
+ 
+ /* ------------------------------------------------------------------ commands */
+-static void push_sz(u16 z)
++static ALWAYS_INLINE void push_sz(u16 z)
+ {
+     gte.SZ0 = gte.SZ1; gte.SZ1 = gte.SZ2; gte.SZ2 = gte.SZ3; gte.SZ3 = z;
+ }
+ 
+-static void push_sxy(s16 x, s16 y)
++static ALWAYS_INLINE void push_sxy(s16 x, s16 y)
+ {
+     gte.SX0 = gte.SX1; gte.SY0 = gte.SY1;
+     gte.SX1 = gte.SX2; gte.SY1 = gte.SY2;
+     gte.SX2 = x;       gte.SY2 = y;
+ }
+ 
+-static void push_rgb(u8 r, u8 g, u8 b)
++static ALWAYS_INLINE void push_rgb(u8 r, u8 g, u8 b)
+ {
+     gte.RGB0 = gte.RGB1; gte.RGB1 = gte.RGB2;
+     gte.RGB2 = (u32)r | ((u32)g << 8) | ((u32)b << 16) | (gte.RGBC & 0xFF000000u);
+ }
+ 
+-static void rtp(s16 vx, s16 vy, s16 vz, int sf, int lm, int last)
++static ALWAYS_INLINE void rtp(s16 vx, s16 vy, s16 vz, int sf, int lm, int last)
+ {
+     int s = sf ? 12 : 0;
+     s64 x = (s64)gte.TRX * 0x1000 + (s64)gte.RT[0] * vx + (s64)gte.RT[1] * vy + (s64)gte.RT[2] * vz;
+@@ -345,7 +194,7 @@
+ 
+ /* Generic matrix x vector product, shared by mvmva and the family of lighting
+    calculations. */
+-static void mat_vec(const s16 *m, s16 vx, s16 vy, s16 vz,
++static ALWAYS_INLINE void mat_vec(const s16 *m, s16 vx, s16 vy, s16 vz,
+                     s32 t0, s32 t1, s32 t2, int sf, int lm)
+ {
+     int s = sf ? 12 : 0;
+@@ -360,7 +209,7 @@
+     gte.IR3 = sat_ir(3, gte.MAC3, lm);
+ }
+ 
+-static void interp_far(int sf, int lm, s32 r, s32 g, s32 b)
++static ALWAYS_INLINE void interp_far(int sf, int lm, s32 r, s32 g, s32 b)
+ {
+     /* MAC <- MAC + IR0 * (FC - MAC), at the hardware's scale.
+      *
+@@ -392,7 +241,7 @@
+     push_rgb(sat_col(1, mac[0] >> 4), sat_col(2, mac[1] >> 4), sat_col(3, mac[2] >> 4));
+ }
+ 
+-static void light_color(s16 vx, s16 vy, s16 vz, int sf, int lm, int use_rgb, int fog)
++static ALWAYS_INLINE void light_color(s16 vx, s16 vy, s16 vz, int sf, int lm, int use_rgb, int fog)
+ {
+     int s = sf ? 12 : 0;
+     s32 r, g, b;
+@@ -426,10 +275,13 @@
+              sat_col(3, gte.MAC3 >> 4));
+ }
+ 
+-void gte_command(u32 code)
++/* The command itself, compiled twice: once for each value of sf. Every
++ * calculation shifts by sf * 12, and on the Pentium III a 64-bit shift by a
++ * variable is a branch and two shifts where a shift by a constant is one
++ * instruction; the helpers are inlined so that the constant reaches them. */
++static ALWAYS_INLINE void command(u32 code, int sf)
+ {
+     int fn = code & 0x3F;
+-    int sf = (code >> 19) & 1;
+     int lm = (code >> 10) & 1;
+     int s = sf ? 12 : 0;
+     gte.FLAG = 0;
+@@ -555,3 +407,9 @@
+     }
+     flag_end();
+ }
++
++void gte_command(u32 code)
++{
++    if ((code >> 19) & 1) command(code, 1);
++    else command(code, 0);
++}
+--- a/tools/m0/gte.h
++++ b/tools/m0/gte.h
+@@ -58,4 +58,187 @@
+ u32 gte_read_ctrl(int reg);
+ void gte_command(u32 code);
+ 
++#if defined(__GNUC__) || defined(__clang__)
++#define ALWAYS_INLINE __inline__ __attribute__((always_inline))
++#else
++#define ALWAYS_INLINE INLINE
+ #endif
++
++/* The register moves, inline: see gte.c. */
++static ALWAYS_INLINE void gte_wd(int reg, u32 v)
++{
++    s16 lo = (s16)(v & 0xFFFF), hi = (s16)(v >> 16);
++    switch (reg) {
++    case 0:  gte.VX0 = lo; gte.VY0 = hi; break;
++    case 1:  gte.VZ0 = lo; break;
++    case 2:  gte.VX1 = lo; gte.VY1 = hi; break;
++    case 3:  gte.VZ1 = lo; break;
++    case 4:  gte.VX2 = lo; gte.VY2 = hi; break;
++    case 5:  gte.VZ2 = lo; break;
++    case 6:  gte.RGBC = v; break;
++    case 7:  gte.OTZ = (u16)v; break;
++    case 8:  gte.IR0 = lo; break;
++    case 9:  gte.IR1 = lo; break;
++    case 10: gte.IR2 = lo; break;
++    case 11: gte.IR3 = lo; break;
++    case 12: gte.SX0 = lo; gte.SY0 = hi; break;
++    case 13: gte.SX1 = lo; gte.SY1 = hi; break;
++    case 14: gte.SX2 = lo; gte.SY2 = hi; break;
++    /* SXYP: writing pushes the stack of screen coordinates. */
++    case 15: gte.SX0 = gte.SX1; gte.SY0 = gte.SY1;
++             gte.SX1 = gte.SX2; gte.SY1 = gte.SY2;
++             gte.SX2 = lo;      gte.SY2 = hi; break;
++    case 16: gte.SZ0 = (u16)v; break;
++    case 17: gte.SZ1 = (u16)v; break;
++    case 18: gte.SZ2 = (u16)v; break;
++    case 19: gte.SZ3 = (u16)v; break;
++    case 20: gte.RGB0 = v; break;
++    case 21: gte.RGB1 = v; break;
++    case 22: gte.RGB2 = v; break;
++    case 23: gte.RES1 = (s32)v; break;
++    case 24: gte.MAC0 = (s32)v; break;
++    case 25: gte.MAC1 = (s32)v; break;
++    case 26: gte.MAC2 = (s32)v; break;
++    case 27: gte.MAC3 = (s32)v; break;
++    /* IRGB: writing unpacks a 5-5-5 colour into IR1-3, at scale x16. */
++    case 28: gte.IRGB = v & 0x7FFF;
++             gte.IR1 = (s16)((v & 0x1F) << 7);
++             gte.IR2 = (s16)(((v >> 5) & 0x1F) << 7);
++             gte.IR3 = (s16)(((v >> 10) & 0x1F) << 7);
++             break;
++    case 29: break;   /* ORGB is read only */
++    case 30: {
++        u32 x = (u32)v, m = (v & 0x80000000u) ? ~x : x;
++        int c = 0;
++        gte.LZCS = (s32)v;
++        while (c < 32 && !(m & 0x80000000u)) { c++; m <<= 1; }
++        gte.LZCR = (v == 0 || v == 0xFFFFFFFFu) ? 32 : c;
++        break;
++    }
++    case 31: break;   /* LZCR is read only */
++    default: break;
++    }
++}
++
++static ALWAYS_INLINE u32 gte_rd(int reg)
++{
++    switch (reg) {
++    case 0:  return (u16)gte.VX0 | ((u32)(u16)gte.VY0 << 16);
++    case 1:  return (u32)(s32)gte.VZ0;
++    case 2:  return (u16)gte.VX1 | ((u32)(u16)gte.VY1 << 16);
++    case 3:  return (u32)(s32)gte.VZ1;
++    case 4:  return (u16)gte.VX2 | ((u32)(u16)gte.VY2 << 16);
++    case 5:  return (u32)(s32)gte.VZ2;
++    case 6:  return gte.RGBC;
++    case 7:  return gte.OTZ;
++    case 8:  return (u32)(s32)gte.IR0;
++    case 9:  return (u32)(s32)gte.IR1;
++    case 10: return (u32)(s32)gte.IR2;
++    case 11: return (u32)(s32)gte.IR3;
++    case 12: return (u16)gte.SX0 | ((u32)(u16)gte.SY0 << 16);
++    case 13: return (u16)gte.SX1 | ((u32)(u16)gte.SY1 << 16);
++    case 14:
++    case 15: return (u16)gte.SX2 | ((u32)(u16)gte.SY2 << 16);
++    case 16: return gte.SZ0;
++    case 17: return gte.SZ1;
++    case 18: return gte.SZ2;
++    case 19: return gte.SZ3;
++    case 20: return gte.RGB0;
++    case 21: return gte.RGB1;
++    case 22: return gte.RGB2;
++    case 23: return (u32)gte.RES1;
++    case 24: return (u32)gte.MAC0;
++    case 25: return (u32)gte.MAC1;
++    case 26: return (u32)gte.MAC2;
++    case 27: return (u32)gte.MAC3;
++    case 28:
++    case 29: {
++        /* ORGB: IR1-3 brought down to 5 bits, saturated, read back as one
++           colour. */
++        s32 r = gte.IR1 / 128, g = gte.IR2 / 128, b = gte.IR3 / 128;
++        r = r < 0 ? 0 : (r > 31 ? 31 : r);
++        g = g < 0 ? 0 : (g > 31 ? 31 : g);
++        b = b < 0 ? 0 : (b > 31 ? 31 : b);
++        return (u32)(r | (g << 5) | (b << 10));
++    }
++    case 30: return (u32)gte.LZCS;
++    case 31: return (u32)gte.LZCR;
++    default: return 0;
++    }
++}
++
++static ALWAYS_INLINE void gte_wc(int reg, u32 v)
++{
++    s16 lo = (s16)(v & 0xFFFF), hi = (s16)(v >> 16);
++    if (reg < 5) { gte.RT[reg * 2] = lo; if (reg * 2 + 1 < 9) gte.RT[reg * 2 + 1] = hi; return; }
++    if (reg >= 8 && reg < 13) { int i = (reg - 8) * 2; gte.LLM[i] = lo; if (i + 1 < 9) gte.LLM[i + 1] = hi; return; }
++    if (reg >= 16 && reg < 21) { int i = (reg - 16) * 2; gte.LCM[i] = lo; if (i + 1 < 9) gte.LCM[i + 1] = hi; return; }
++    switch (reg) {
++    case 5:  gte.TRX = (s32)v; break;
++    case 6:  gte.TRY = (s32)v; break;
++    case 7:  gte.TRZ = (s32)v; break;
++    case 13: gte.RBK = (s32)v; break;
++    case 14: gte.GBK = (s32)v; break;
++    case 15: gte.BBK = (s32)v; break;
++    case 21: gte.RFC = (s32)v; break;
++    case 22: gte.GFC = (s32)v; break;
++    case 23: gte.BFC = (s32)v; break;
++    case 24: gte.OFX = (s32)v; break;
++    case 25: gte.OFY = (s32)v; break;
++    case 26: gte.H = (u16)v; break;
++    case 27: gte.DQA = lo; break;
++    case 28: gte.DQB = (s32)v; break;
++    case 29: gte.ZSF3 = lo; break;
++    case 30: gte.ZSF4 = lo; break;
++    case 31: gte.FLAG = v & 0x7FFFF000u; if (gte.FLAG & 0x7F87E000u) gte.FLAG |= 0x80000000u; break;
++    default: break;
++    }
++}
++
++static ALWAYS_INLINE u32 gte_rc(int reg)
++{
++    if (reg < 5) {
++        u32 a = (u16)gte.RT[reg * 2];
++        u32 b = (reg * 2 + 1 < 9) ? (u32)(u16)gte.RT[reg * 2 + 1] : 0;
++        return (reg == 4) ? (u32)(s32)gte.RT[8] : (a | (b << 16));
++    }
++    if (reg >= 8 && reg < 13) {
++        int i = (reg - 8) * 2;
++        if (reg == 12) return (u32)(s32)gte.LLM[8];
++        return (u32)(u16)gte.LLM[i] | ((u32)(u16)gte.LLM[i + 1] << 16);
++    }
++    if (reg >= 16 && reg < 21) {
++        int i = (reg - 16) * 2;
++        if (reg == 20) return (u32)(s32)gte.LCM[8];
++        return (u32)(u16)gte.LCM[i] | ((u32)(u16)gte.LCM[i + 1] << 16);
++    }
++    switch (reg) {
++    case 5:  return (u32)gte.TRX;
++    case 6:  return (u32)gte.TRY;
++    case 7:  return (u32)gte.TRZ;
++    case 13: return (u32)gte.RBK;
++    case 14: return (u32)gte.GBK;
++    case 15: return (u32)gte.BBK;
++    case 21: return (u32)gte.RFC;
++    case 22: return (u32)gte.GFC;
++    case 23: return (u32)gte.BFC;
++    case 24: return (u32)gte.OFX;
++    case 25: return (u32)gte.OFY;
++    case 26: return (u32)(s32)(s16)gte.H;   /* read back signed: a hardware quirk */
++    case 27: return (u32)(s32)gte.DQA;
++    case 28: return (u32)gte.DQB;
++    case 29: return (u32)(s32)gte.ZSF3;
++    case 30: return (u32)(s32)gte.ZSF4;
++    case 31: return gte.FLAG;
++    default: return 0;
++    }
++}
++
++#ifndef GTE_IMPL
++#define gte_write_data(r, v) gte_wd(r, v)
++#define gte_read_data(r) gte_rd(r)
++#define gte_write_ctrl(r, v) gte_wc(r, v)
++#define gte_read_ctrl(r) gte_rc(r)
++#endif
++
++#endif
+--- a/tools/m0/hw.c
++++ b/tools/m0/hw.c
+@@ -645,10 +645,14 @@
+    for -- and therefore what it is missing. */
+ extern int in_irq_flag;
+ u32 hw_irq_addr[64]; unsigned long hw_irq_cnt[64]; int hw_irq_n;
++
++static u32 access_last, access_prev;   /* the two latest addresses touched */
+ 
+ static void note(u32 p, int write)
+ {
+     int i;
++    access_prev = access_last;
++    access_last = p;
+     if (in_irq_flag) {
+         for (i = 0; i < hw_irq_n; i++)
+             if (hw_irq_addr[i] == p) { hw_irq_cnt[i]++; goto done; }
+@@ -684,6 +688,41 @@
+     return hw_read32(p & ~3u) >> (8 * (p & 2));
+ }
+ 
++/* The VSync wait, skipped without being changed.
++ *
++ * In its non-interlaced branch, VSync (func_80048DC4) masks the vertical
++ * blank out of I_MASK and then spins on I_STAT:
++ *
++ *     while (!(*I_STAT & 1)) ;
++ *
++ * Nothing in that loop writes anything. Each turn costs a full trip through
++ * hw_read32, and the turns go on until the frame's instruction budget is
++ * spent -- some 37,000 reads per frame drawn, a third of the host's time on a
++ * desktop and more than the whole frame on a 733 MHz Xbox.
++ *
++ * The turns that cannot change anything are skipped, and only those: when
++ * I_STAT is read twice in a row with no other register in between, at the
++ * same distance in cycles, with no interrupt deliverable and the drive idle,
++ * the clock is advanced by as many whole turns as fit before the deadline.
++ * The turn that crosses the vertical blank then runs for real, at the cycle
++ * count it would have reached anyway: the game sees the same blank at the
++ * same instruction. Only the statistics read fewer accesses. */
++static unsigned long long poll_at, poll_step;
++unsigned long polls_skipped;
++
++static void istat_poll(void)
++{
++    unsigned long long d = g_cycles - poll_at;
++    if (access_prev == 0x1F801070 && !in_irq_flag && !cd_pend && !(istat & imask)
++        && d && d == poll_step && g_cycles + d < g_deadline) {
++        unsigned long long turns = (g_deadline - 1 - g_cycles) / d;
++        g_cycles += turns * d;
++        polls_skipped += (unsigned long)turns;
++    }
++    poll_step = d;
++    poll_at = g_cycles;
++}
++
+ u32 hw_read32(u32 p)
+ {
+     hw_reads++;
+@@ -724,7 +763,7 @@
+     case 0x1F8010E8: return dma6_chcr;
+     case 0x1F801800: case 0x1F801801:
+     case 0x1F801802: case 0x1F801803: return cd_read(p);
+-    case 0x1F801070: return istat;
++    case 0x1F801070: istat_poll(); return istat;
+     case 0x1F801074: return imask;
+     default:
+         if (p >= 0x1F801C00 && p < 0x1F801E80) return spu_read16(p);
+--- a/tools/m0/mods.c
++++ b/tools/m0/mods.c
+@@ -87,6 +87,11 @@
+ extern int g_draw_cost;
+ extern int mod_mute_music, mod_mute_spu, mod_show_state, mod_negcon;
+ extern int mod_show_pad;
++/* A line the platform writes once a second -- frame rate and where the time
++   goes -- shown when PERFORMANCE is on. A platform that measures nothing
++   leaves it empty. */
++int mod_show_perf;
++char mod_perf_text[64];
+ extern u32 g_pad_word;
+ extern unsigned char g_pad_analog[4];
+ extern int g_pad_type;
+@@ -120,13 +125,19 @@
+     { "MUSIC",              &mod_mute_music,     0,   1,  1, t_no,  a_none },
+     { "EFFECTS",            &mod_mute_spu,       0,   1,  1, t_no,  a_none },
+     { "GAME STATE",         &mod_show_state,     0,   1,  1, t_yes, a_none },
++    { "PERFORMANCE",        &mod_show_perf,      0,   1,  1, t_yes, a_none },
+ };
+ #define NSETTINGS ((int)(sizeof SETTINGS / sizeof SETTINGS[0]))
+ 
+ static int menu_open, choice;
+ 
+ int mods_is_open(void) { return menu_open; }
+-void mods_toggle(void) { menu_open = !menu_open; }
++void mods_toggle(void)
++{
++    menu_open = !menu_open;
++    /* The platform may start at another rate than 60: show the one in force. */
++    if (menu_open) hz_i = (int)mod_hz;
++}
+ 
+ void mods_move(int d)
+ {
+@@ -189,6 +200,8 @@
+         sprintf(line, "STATE %u", e);
+         text(px, pitch, w, h, 4, 4, line, 0xFF00FF00u);
+     }
++    if (mod_show_perf && mod_perf_text[0])
++        text(px, pitch, w, h, 4, mod_show_state ? 14 : 4, mod_perf_text, 0xFFFFFF00u);
+     if (mod_show_pad) {
+         /* The word is active low, as on the console: FFFF means nothing is
+            pressed. This is the number to watch -- if it does not move when a
+--- a/tools/m0/rt.h
++++ b/tools/m0/rt.h
+@@ -14,8 +14,9 @@
+ typedef signed char s8; typedef short s16; typedef int s32; typedef long long s64;
+ 
+ /* IDO 5.3 knows neither `inline` nor any __builtin: it spells the keyword
+-   __inline, and at -O2 really does inline what is so marked. */
+-#if defined(__GNUC__)
++   __inline, and at -O2 really does inline what is so marked. Clang aimed at
++   a Windows target, as for the Xbox, does not call itself __GNUC__. */
++#if defined(__GNUC__) || defined(__clang__)
+ #define INLINE __inline__
+ #elif defined(__sgi)
+ #define INLINE __inline

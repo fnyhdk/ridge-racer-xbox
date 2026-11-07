@@ -1,0 +1,20 @@
+# Generated from your own PSX.EXE: the game's code in another notation.
+gen/
+# Your own game data, copied next to the XBE.
+bin/
+*.iso
+*.zip
+# Build products.
+*.obj
+*.d
+main.exe
+main.lib
+main.exe.manifest
+test/host/obj/
+test/host/xbox_host
+test/host/out*/
+test/i386/
+# Frames captured by the tests are pictures of the game.
+*.ppm
+.DS_Store
+test/host/pictest
