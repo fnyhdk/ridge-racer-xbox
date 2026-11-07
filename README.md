@@ -1,5 +1,13 @@
 # Ridge Racer for the original Xbox
 
+## Transparency
+
+This is my first port and I'm still learning. I used
+[Claude Code](https://claude.com/claude-code) to help write it, and I reviewed
+and tested the work myself throughout.
+
+## About
+
 A port of Ridge Racer (PlayStation, Namco 1994, Japanese release SLPS-00001) to
 the original Xbox, built with [nxdk](https://github.com/XboxDev/nxdk).
 
