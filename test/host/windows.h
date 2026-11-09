@@ -18,4 +18,5 @@ void Sleep(DWORD);
 BOOL QueryPerformanceCounter(LARGE_INTEGER *);
 BOOL QueryPerformanceFrequency(LARGE_INTEGER *);
 void *MmAllocateContiguousMemoryEx(size_t, unsigned long, unsigned long, unsigned long, unsigned long);
+void MmFreeContiguousMemory(void *);
 #endif

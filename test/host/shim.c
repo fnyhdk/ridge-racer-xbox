@@ -7,6 +7,11 @@
  * counts the flips. D:\ is mapped to the XBE's directory, as nxdk does.
  *
  *   HOST_D=../../bin HOST_OUT=out HOST_SECONDS=60 ./xbox_host
+ *
+ * HOST_NO_720P=1 plays a dashboard with 720p off, HOST_480I=1 one with 480p
+ * off, and HOST_RES="20:1 30:0" moves RESOLUTION at 20 s and 30 s, as the
+ * settings menu would. HOST_MENU=25 opens the settings menu at 25 s, with
+ * the second item chosen.
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -50,6 +55,24 @@ int XVideoSetMode(int w, int h, int bpp, int r)
     return 1;
 }
 
+/* The modes nxdk would list: 480 always, 720p unless switched off. */
+int XVideoListModes(VIDEO_MODE *vm, int bpp, int r, void **p)
+{
+    int i = (int)(intptr_t)*p;
+    (void)r;
+    if (i == 1 && getenv("HOST_NO_720P")) i++;
+    if (i > 1) return 0;
+    vm->width = i ? 1280 : 640; vm->height = i ? 720 : 480;
+    vm->bpp = bpp; vm->refresh = 60;
+    *p = (void *)(intptr_t)(i + 1);
+    return 1;
+}
+
+unsigned int XVideoGetEncoderSettings(void)
+{
+    return getenv("HOST_480I") ? 0 : VIDEO_MODE_480P;
+}
+
 void XVideoFlushFB(void) {}
 
 volatile unsigned int *host_videoreg(unsigned int off)
@@ -66,6 +89,14 @@ void *MmAllocateContiguousMemoryEx(size_t n, unsigned long lo, unsigned long hi,
     if (posix_memalign(&p, align ? align : 16, n)) return 0;
     if (nbuffers < 4) buffers[nbuffers++] = p;
     return p;
+}
+
+void MmFreeContiguousMemory(void *p)
+{
+    int i;
+    for (i = 0; i < nbuffers; i++)
+        if (buffers[i] == p) { buffers[i] = buffers[--nbuffers]; break; }
+    free(p);
 }
 
 struct thr { pthread_t t; LPTHREAD_START_ROUTINE f; LPVOID a; };
@@ -133,6 +164,7 @@ static void capture(const char *dir, int n)
 DWORD WaitForSingleObject(HANDLE h, DWORD ms)
 {
     const char *o = getenv("HOST_OUT"), *s = getenv("HOST_SECONDS");
+    const char *res = getenv("HOST_RES");
     int seconds = s ? atoi(s) : 30, n = 0, t;
     unsigned long before = 0;
     (void)h; (void)ms;
@@ -144,6 +176,25 @@ DWORD WaitForSingleObject(HANDLE h, DWORD ms)
             printf("host: %lu flips in the last second  [%s]\n", crtc_writes - before, mod_perf_text);
             fflush(stdout);
             before = crtc_writes;
+        }
+        if (getenv("HOST_MENU") && t == 2 * atoi(getenv("HOST_MENU"))) {
+            void mods_toggle(void), mods_move(int);
+            mods_toggle();
+            mods_move(+1);
+        }
+        if (res && t % 2 == 0) {
+            /* RESOLUTION, moved as the menu moves it. The frame after is
+               not captured: the buffers may be changing under it. */
+            extern int mod_res;
+            const char *q = res;
+            int at, v, moved = 0;
+            while (sscanf(q, "%d:%d", &at, &v) == 2) {
+                if (at == t / 2) { mod_res = v; moved = 1; printf("host: RESOLUTION %d\n", v); }
+                q = strchr(q, ' ');
+                if (!q) break;
+                q++;
+            }
+            if (moved) { n++; continue; }
         }
         if (o) capture(o, n++);
     }

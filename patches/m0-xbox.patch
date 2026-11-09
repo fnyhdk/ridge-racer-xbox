@@ -1160,7 +1160,7 @@
          if (p >= 0x1F801C00 && p < 0x1F801E80) return spu_read16(p);
 --- a/tools/m0/mods.c
 +++ b/tools/m0/mods.c
-@@ -87,6 +87,11 @@
+@@ -87,10 +87,21 @@
  extern int g_draw_cost;
  extern int mod_mute_music, mod_mute_spu, mod_show_state, mod_negcon;
  extern int mod_show_pad;
@@ -1172,7 +1172,37 @@
  extern u32 g_pad_word;
  extern unsigned char g_pad_analog[4];
  extern int g_pad_type;
-@@ -120,13 +125,19 @@
+ 
++/* Screen modes the platform can change to while the game runs, by name, and
++   the one chosen: the platform watches mod_res and switches when it moves.
++   The item is shown only when there are two or more to choose from. */
++int mod_res, mod_res_count;
++const char *mod_res_names[4];
++
+ static int hz_i = 60;
+ static int lat_i = 40;
+ 
+@@ -107,12 +118,19 @@
+ static void t_no(int v, char *s)   { strcpy(s, v ? "NO" : "YES"); }
+ static void t_pad(int v, char *s)  { strcpy(s, v ? "NEGCON" : "DIGITAL"); }
+ 
++static void t_res(int v, char *s)
++{
++    strcpy(s, v >= 0 && v < mod_res_count ? mod_res_names[v] : "-");
++}
++
+ static void a_hz(int v)  { mod_hz = v; }
++static void a_res(int v) { if (v >= mod_res_count) mod_res = mod_res_count - 1; }
+ static void a_lat(int v) { g_latency_bytes = 44100u * 4u * (unsigned)v / 1000u; }
+ static void a_none(int v){ (void)v; }
+ 
+ static struct setting SETTINGS[] = {
+     { "FRAMES PER SECOND",  &hz_i,               0, 240, 10, t_hz,  a_hz   },
++    { "RESOLUTION",         &mod_res,            0,   3,  1, t_res, a_res  },
+     { "AUDIO LEAD",         &lat_i,              5, 200,  5, t_ms,  a_lat  },
+     { "CONTROLLER",         &mod_negcon,         0,   1,  1, t_pad, a_none },
+     { "SHOW CONTROLLER",    &mod_show_pad,       0,   1,  1, t_yes, a_none },
+@@ -120,19 +138,32 @@
      { "MUSIC",              &mod_mute_music,     0,   1,  1, t_no,  a_none },
      { "EFFECTS",            &mod_mute_spu,       0,   1,  1, t_no,  a_none },
      { "GAME STATE",         &mod_show_state,     0,   1,  1, t_yes, a_none },
@@ -1182,6 +1212,11 @@
  
  static int menu_open, choice;
  
++static int shown(int i)
++{
++    return SETTINGS[i].value != &mod_res || mod_res_count > 1;
++}
++
  int mods_is_open(void) { return menu_open; }
 -void mods_toggle(void) { menu_open = !menu_open; }
 +void mods_toggle(void)
@@ -1193,7 +1228,26 @@
  
  void mods_move(int d)
  {
-@@ -189,6 +200,8 @@
+-    choice += d;
+-    if (choice < 0) choice = NSETTINGS - 1;
+-    if (choice >= NSETTINGS) choice = 0;
++    do {
++        choice += d;
++        if (choice < 0) choice = NSETTINGS - 1;
++        if (choice >= NSETTINGS) choice = 0;
++    } while (!shown(choice));
+ }
+ 
+ void mods_change(int d)
+@@ -182,13 +213,15 @@
+ void mods_draw(u32 *px, int pitch, int w, int h)
+ {
+     char line[64], val[24];
+-    int i, y;
++    int i, y, rows;
+     extern unsigned long states_seen[64];
+     if (mod_show_state) {
+         u32 e = RAM32(0x1D34F8);
          sprintf(line, "STATE %u", e);
          text(px, pitch, w, h, 4, 4, line, 0xFF00FF00u);
      }
@@ -1202,6 +1256,27 @@
      if (mod_show_pad) {
          /* The word is active low, as on the console: FFFF means nothing is
             pressed. This is the number to watch -- if it does not move when a
+@@ -200,15 +233,18 @@
+     }
+     if (!menu_open) return;
+ 
+-    backdrop(px, pitch, w, h, 8, 20, w - 8, 20 + 14 * NSETTINGS + 24);
++    for (i = rows = 0; i < NSETTINGS; i++) rows += shown(i);
++    backdrop(px, pitch, w, h, 8, 20, w - 8, 20 + 14 * rows + 24);
+     text(px, pitch, w, h, 16, 26, "SETTINGS", 0xFFFFFF00u);
+     y = 44;
+-    for (i = 0; i < NSETTINGS; i++, y += 14) {
++    for (i = 0; i < NSETTINGS; i++) {
+         u32 c = (i == choice) ? 0xFFFFFF00u : 0xFFB0B0B0u;
++        if (!shown(i)) continue;
+         SETTINGS[i].format(*SETTINGS[i].value, val);
+         sprintf(line, "%c %-18s %s", (i == choice) ? '>' : ' ',
+                 SETTINGS[i].name, val);
+         text(px, pitch, w, h, 16, y, line, c);
++        y += 14;
+     }
+     text(px, pitch, w, h, 16, y + 6, "F1 CLOSE   ARROWS ADJUST", 0xFF808080u);
+     (void)states_seen;
 --- a/tools/m0/rt.h
 +++ b/tools/m0/rt.h
 @@ -14,8 +14,9 @@

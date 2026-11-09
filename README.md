@@ -124,8 +124,9 @@ are analogue. `CONTROLLER` in the settings menu switches to a standard digital
 pad.
 
 The settings menu (d-pad to move and change values, Back to close) sets the
-frame rate, audio latency, draw-cost model, music and effects muting, and
-controller type, and turns on the performance display.
+frame rate, resolution, audio latency, draw-cost model, music and effects
+muting, and controller type, and turns on the performance display. Settings
+last until the game is switched off; they are not saved.
 
 ## Sound and music
 
@@ -166,6 +167,14 @@ mode follows the Xbox's AV cable and dashboard settings:
 
 720p and 480p are enabled under **Settings → Video** in the Xbox dashboard.
 nxdk has no HD modes for PAL consoles.
+
+The game starts in the best mode the dashboard allows. Where that is 720p,
+**RESOLUTION** in the settings menu changes between 720P and 480 (shown as
+480P, or 480I if 480p is not enabled) while the game runs, with no restart.
+Each mode is drawn at its own size, as if the console had started in it;
+nothing is scaled from one to the other. The television may take a moment
+to adjust. On other setups there is only one mode, and the setting is not
+shown.
 
 The game runs at 30 frames per second, as on the PlayStation. Ridge Racer's
 logic is locked to the frame rate, so the game speed depends on it: at 60 the
@@ -224,6 +233,10 @@ test/host/build.sh
 HOST_D=bin HOST_OUT=test/host/out HOST_SECONDS=60 \
 PAD_SCRIPT="1200:start 1260: 1600:start 1660: 2200:cross" test/host/xbox_host
 ```
+
+`HOST_NO_720P=1` plays a console whose dashboard has 720p turned off,
+`HOST_RES="20:1 30:0"` changes RESOLUTION to 480 at 20 seconds and back at
+30, and `HOST_MENU=25` opens the settings menu at 25 seconds.
 
 ## License
 

@@ -23,7 +23,15 @@ VIDEO_MODE XVideoGetMode(void) { return mode; }
 int XVideoSetMode(int w, int h, int bpp, int r)
 { (void)r; if (h == 720 && no720) { memset(&mode, 0, sizeof mode); return 0; }
   mode.width = w; mode.height = h; mode.bpp = bpp; return 1; }
+int XVideoListModes(VIDEO_MODE *vm, int bpp, int r, void **p)
+{ int i = (int)(intptr_t)*p; (void)r; if (i == 1 && no720) i++; if (i > 1) return 0;
+  vm->width = i ? 1280 : 640; vm->height = i ? 720 : 480; vm->bpp = bpp;
+  *p = (void *)(intptr_t)(i + 1); return 1; }
+unsigned int XVideoGetEncoderSettings(void) { return VIDEO_MODE_480P; }
 void XVideoFlushFB(void) {}
+void MmFreeContiguousMemory(void *q) { free(q); }
+int mod_res, mod_res_count;
+const char *mod_res_names[4];
 volatile unsigned int *host_videoreg(unsigned int o) { return o == 0x00600800 ? &crtc : &other; }
 void *MmAllocateContiguousMemoryEx(size_t n, unsigned long a, unsigned long b, unsigned long al, unsigned long p)
 { void *q; (void)a; (void)b; (void)p; if (posix_memalign(&q, al, n)) return 0; bufs[nb++ & 1] = q; return q; }
@@ -91,10 +99,14 @@ int main(int argc, char **argv)
         {0, 0, 256, 240}, {100, 3, 368, 240}, {0, 0, 512, 480}, {700, 100, 640, 480},
         {0, 0, 321, 241}, {5, 7, 320, 30},
     };
-    int i, k, fails = 0;
+    int i, k, r, fails = 0;
     no720 = argc > 1;
     srand(1);
     if (!video_init()) { printf("video_init failed\n"); return 1; }
+    /* Then, where 720p is allowed, RESOLUTION to 480 and back: each mode is
+       checked again after the switch, with the buffers made anew. */
+    for (r = 0; r < (mod_res_count > 1 ? 3 : 1); r++) {
+    mod_res = r & 1;
     for (k = 0; k < 4; k++) {
         menu = k & 1;
         for (i = 0; i < 1024 * 512; i++) vram[i] = (u16)(rand() ^ (rand() << 8));
@@ -102,6 +114,9 @@ int main(int argc, char **argv)
             video_image(vram, areas[i][0], areas[i][1], areas[i][2], areas[i][3]);
             fails += check(areas[i][0], areas[i][1], areas[i][2], areas[i][3]);
         }
+    }
+    printf("%dx%d checked\n", mode.width, mode.height);
+    if (mod_res_count > 1 && mode.height != (mod_res ? 480 : 720)) fails++;
     }
     printf(fails ? "FAILED\n" : "all exact\n");
     return fails != 0;

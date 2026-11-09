@@ -62,9 +62,18 @@ void mods_draw(u32 *, int, int, int);
  * NTSC console: nxdk offers no HD mode in PAL. The PlayStation's 240 lines
  * triple exactly into 720, and its 4:3 picture is 960 wide, between two black
  * bars. Otherwise 640 by 480, which the console sends as 480p or 480i by the
- * same settings. */
+ * same settings.
+ *
+ * Where 720p is allowed, RESOLUTION in the settings changes between it and
+ * 480 while the game runs. The mode is set again, as at boot, and the
+ * picture is drawn at the new size: nothing is scaled from one to the other.
+ * The television takes a moment to follow, as with any change of mode. */
 static int screen_w, screen_h;
 static int pic_x, pic_w, pic_h;
+static int mapped_w;         /* the width video_image's column map was made for */
+extern int mod_res, mod_res_count;
+extern const char *mod_res_names[4];
+static int res_shown;        /* the mod_res the screen is in: 0 720p, 1 480 */
 
 /* Thirty presented frames per second, not sixty.
  *
@@ -102,11 +111,25 @@ static void pad_close(void)
     if (pad) { SDL_GameControllerClose(pad); pad = 0; }
 }
 
-int video_init(void)
+/* Whether the dashboard allows 720p: the modes nxdk lists are the ones it
+   would set. */
+static int hd_allowed(void)
+{
+    VIDEO_MODE vm;
+    void *p = NULL;
+    while (XVideoListModes(&vm, 15, REFRESH_DEFAULT, &p))
+        if (vm.width == 1280 && vm.height == 720) return 1;
+    return 0;
+}
+
+/* Puts the console in 720p or in 640 by 480, with two framebuffers of that
+ * size. Setting the mode points the display at nxdk's own framebuffer, so
+ * ours can be freed and made again behind it. */
+static int screen_open(int hd)
 {
     int i;
-    conv_init();
-    if (XVideoSetMode(1280, 720, 15, REFRESH_DEFAULT)) {
+    if (hd) {
+        if (!XVideoSetMode(1280, 720, 15, REFRESH_DEFAULT)) return 0;
         screen_w = 1280; screen_h = 720;
     } else {
         VIDEO_MODE vm = XVideoGetMode();
@@ -117,8 +140,11 @@ int video_init(void)
     pic_h = screen_h;
     pic_w = screen_h * 4 / 3;
     pic_x = (screen_w - pic_w) / 2;
+    mapped_w = 0;
     printf("video: %dx%d, picture %dx%d\n", screen_w, screen_h, pic_w, pic_h);
     /* The bars are cleared here once; only the picture is written after. */
+    for (i = 0; i < 2; i++)
+        if (screens[i]) { MmFreeContiguousMemory(screens[i]); screens[i] = NULL; }
     for (i = 0; i < 2; i++) {
         screens[i] = MmAllocateContiguousMemoryEx(screen_w * screen_h * 2,
                                                   0, 0x7FFFFFFF, 0x1000,
@@ -128,6 +154,37 @@ int video_init(void)
     }
     VIDEOREG(PCRTC_START) = (unsigned int)screens[0] & 0x7FFFFFFF;
     back = 1;
+    return 1;
+}
+
+/* RESOLUTION has moved: change mode, between frames. Should 720p fail now
+   that it worked before, or its memory not be found, the game carries on in
+   480 rather than with no screen at all. */
+static void screen_follow(void)
+{
+    if (mod_res == res_shown || mod_res_count < 2) return;
+    if (!screen_open(mod_res == 0) && !screen_open(0)) {
+        closed = 1;
+        return;
+    }
+    res_shown = mod_res = screen_h == 720 ? 0 : 1;
+}
+
+int video_init(void)
+{
+    int hd;
+    int i;
+    conv_init();
+    hd = hd_allowed();
+    if (!(hd && screen_open(1)) && !screen_open(0)) return 0;
+    if (hd) {
+        /* nxdk picks 480p over 480i whenever the dashboard allows it. */
+        DWORD enc = XVideoGetEncoderSettings();
+        mod_res_names[0] = "720P";
+        mod_res_names[1] = (enc & VIDEO_MODE_480P) ? "480P" : "480I";
+        mod_res_count = 2;
+    }
+    res_shown = mod_res = screen_h == 720 ? 0 : 1;
     perf_init();
 
     if (SDL_Init(SDL_INIT_GAMECONTROLLER) != 0) {
@@ -377,7 +434,6 @@ static INLINE u32 swap15(u32 c)
 void video_image(const u16 *vram, int x, int y, int w, int h)
 {
     static int xmap[960];
-    static int mapped_w;
     /* One source line at the screen's depth, and one scaled line of the
        picture, two pixels to a word: both stay in the first-level cache. */
     static u32 line15[640];
@@ -385,6 +441,7 @@ void video_image(const u16 *vram, int x, int y, int w, int h)
     u32 *dst;
     int i, j, k, last, words, open;
     unsigned long long start = perf_now(), flipped, shown;
+    screen_follow();
     if (!screens[0]) return;
     if (w > 640) w = 640;
     if (h > 480) h = 480;
